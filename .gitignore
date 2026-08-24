@@ -1,0 +1,54 @@
+### 编译输出 ###
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+!**/src/**/target/
+
+### 日志 ###
+logs/
+*.log
+
+### IDEA ###
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+### Eclipse / STS ###
+.settings/
+.project
+.classpath
+.factorypath
+.apt_generated/
+bin/
+
+### VS Code ###
+.vscode/
+.history/
+
+### NetBeans ###
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+### Spring Boot ###
+*.original
+application-local.yml
+application-local.properties
+
+### 操作系统 ###
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+### 其他 ###
+*.swp
+*~
+.mvn/wrapper/maven-wrapper.jar
+!.mvn/wrapper/maven-wrapper.properties

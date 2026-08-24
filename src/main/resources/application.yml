@@ -1,0 +1,10 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: wcs-monitor-demo
+
+logging:
+  level:
+    com.wcs.monitor: debug
