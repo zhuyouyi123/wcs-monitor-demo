@@ -16,7 +16,7 @@ public class SysConfigServiceImpl extends ServiceImpl<SysConfigMapper, SysConfig
 
     private static final Set<String> ALLOWED_KEYS = Set.of(
             "systemName", "warehouseCode", "pageSize",
-            "connectTimeout", "heartbeatInterval", "autoReconnect", "reconnectTimes",
+            "connectTimeout", "connIdleTimeout",
             "autoDispatch", "dispatchInterval", "maxTaskPerDevice",
             "refreshInterval", "alarmSound", "opLogKeepDays", "alarmLogKeepDays"
     );

@@ -28,6 +28,7 @@ public class DeviceInfoController {
     private final DeviceConnectionManager deviceConnectionManager;
     private final DeviceCommBindingService deviceCommBindingService;
     private final ConveyorNodeService conveyorNodeService;
+    private final com.wcs.monitor.service.MonitorTaskService monitorTaskService;
 
     @GetMapping
     public Result<List<DeviceInfo>> list(@RequestParam(required = false) DeviceType deviceType) {
@@ -69,7 +70,11 @@ public class DeviceInfoController {
 
     @DeleteMapping("/{id}")
     public Result<Boolean> delete(@PathVariable Long id) {
-        deviceConnectionManager.disconnect(id);
+        // 有正在执行的监控任务时禁止删除
+        if (monitorTaskService.hasRunningTask(id)) {
+            return Result.fail("该设备存在正在执行的状态监控任务，请先停止对应任务后再删除");
+        }
+        deviceConnectionManager.disconnect(id, "设备删除，自动断开");
         deviceCommBindingService.removeByDeviceId(id);
         conveyorNodeService.removeByDeviceId(id);
         return Result.ok(deviceInfoService.removeById(id));
@@ -97,9 +102,10 @@ public class DeviceInfoController {
     }
 
     @PostMapping("/{id}/disconnect")
-    public Result<Boolean> disconnect(@PathVariable Long id) {
-        deviceConnectionManager.disconnect(id);
-        return Result.ok(true);
+    public Result<String> disconnect(@PathVariable Long id) {
+        String reason = "用户手动断开";
+        deviceConnectionManager.disconnect(id, reason);
+        return Result.ok(reason);
     }
 
     @GetMapping("/{id}/s7/read")

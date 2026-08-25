@@ -8,70 +8,226 @@ import com.wcs.monitor.enums.ConnectStatus;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
+/**
+ * 按需连接管理：
+ * 1. 只有真正需要通信（如 S7 读取）时才建立连接；
+ * 2. 连接成功后若连续一段时间没有通信，自动断开并落库；
+ * 3. 所有断开均记录原因。
+ */
 @Slf4j
 @Service
 public class DeviceConnectionManager {
 
     private static final int CONNECT_TIMEOUT_MS = 3000;
-    private static final long RETRY_INTERVAL_MS = 10_000L;
-    private static final long MONITOR_INTERVAL_MS = 5_000L;
-    private static final int S7_PORT = 102;
+    private static final long REAP_INTERVAL_MS = 5_000L;
+    private static final long DEFAULT_IDLE_TIMEOUT_MS = 60_000L;
     private static final int RACK = 0;
     private static final int SLOT = 0;
 
     private final DeviceInfoService deviceInfoService;
+    private final SysConfigService sysConfigService;
+
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "device-connection");
+        Thread t = new Thread(r, "device-connect");
         t.setDaemon(true);
         return t;
     });
-    private final Map<Long, ConnectionHandle> connections = new ConcurrentHashMap<>();
 
-    public DeviceConnectionManager(DeviceInfoService deviceInfoService) {
+    private final ScheduledExecutorService reaper = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "device-idle-reaper");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private final Map<Long, ManagedConnection> connections = new ConcurrentHashMap<>();
+
+    public DeviceConnectionManager(DeviceInfoService deviceInfoService, SysConfigService sysConfigService) {
         this.deviceInfoService = deviceInfoService;
+        this.sysConfigService = sysConfigService;
     }
 
+    @PostConstruct
+    public void startReaper() {
+        reaper.scheduleWithFixedDelay(this::reapIdleConnections,
+                REAP_INTERVAL_MS, REAP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 手动预热连接：立即建立连接（单次尝试，不再无限重试），
+     * 后续通信复用该连接；若失败状态置为连接失败。
+     */
     public void connect(Long id) {
         DeviceInfo device = requireDevice(id);
         if (connections.containsKey(id)) {
-            log.info("设备[{}]连接任务执行中，忽略重复连接请求", device.getDeviceCode());
+            touch(id);
+            log.info("设备[{}]已存在有效连接，忽略重复连接请求", device.getDeviceCode());
             return;
         }
         updateStatus(id, ConnectStatus.CONNECTING);
-        ConnectionWorker worker = new ConnectionWorker(id, device.getDeviceCode(), device.getIpAddress(), device.getPort());
-        Future<?> future = executor.submit(worker);
-        connections.put(id, new ConnectionHandle(worker, future));
-        log.info("设备[{}]发起连接 {}:{}", device.getDeviceCode(), device.getIpAddress(), device.getPort());
+        executor.submit(() -> {
+            try {
+                openConnection(device);
+                updateStatus(id, ConnectStatus.CONNECTED);
+                log.info("设备[{}]连接成功", device.getDeviceCode());
+            } catch (Exception e) {
+                updateStatus(id, ConnectStatus.CONNECT_FAILED);
+                log.warn("设备[{}]连接失败，原因：{}", device.getDeviceCode(), e.getMessage());
+            }
+        });
     }
 
-    public void disconnect(Long id) {
-        ConnectionHandle handle = connections.remove(id);
-        if (handle != null) {
-            stopHandle(handle);
-            log.info("设备[{}]已断开连接", handle.worker.deviceCode);
-        } else if (!updateStatus(id, ConnectStatus.DISCONNECTED)) {
+    /** 手动断开 */
+    public void disconnect(Long id, String reason) {
+        String safeReason = reason == null || reason.isBlank() ? "未指定原因" : reason;
+        ManagedConnection mc = connections.remove(id);
+        if (mc != null) {
+            closeQuietly(mc);
+            log.info("设备[{}]断开连接，原因：{}", mc.deviceCode, safeReason);
+        }
+        if (!updateStatus(id, ConnectStatus.DISCONNECTED)) {
             throw new IllegalArgumentException("设备不存在: " + id);
         }
     }
 
+    /**
+     * 通信入口：确保连接可用（不可用则现场建立），并刷新最后使用时间。
+     * 连接即在此刻按需创建，无需提前手动连接。
+     */
     public byte[] readDB(Long deviceId, int dbNumber, int start, int size) {
-        ConnectionHandle handle = connections.get(deviceId);
-        if (handle == null || !handle.worker.isAlive()) {
-            throw new IllegalStateException("堆垛机未连接，请先连接设备");
+        ManagedConnection mc = ensureConnected(deviceId);
+        mc.lastUsedAt = System.currentTimeMillis();
+        synchronized (mc.ioLock) {
+            try {
+                return mc.connector.read(DaveArea.DB, dbNumber, size, start);
+            } catch (Exception e) {
+                String reason = "通信异常: " + e.getMessage();
+                log.warn("设备[{}]断开连接，原因：{}（读取 DB{} 偏移{} 失败）",
+                        mc.deviceCode, reason, dbNumber, start);
+                closeAndRemove(deviceId, mc, reason);
+                updateStatus(deviceId, ConnectStatus.CONNECT_FAILED);
+                throw new IllegalStateException("S7 读取失败: " + e.getMessage());
+            }
         }
-        return handle.worker.readDB(dbNumber, start, size);
+    }
+
+    private ManagedConnection ensureConnected(Long deviceId) {
+        ManagedConnection mc = connections.get(deviceId);
+        if (mc != null && isAlive(mc)) {
+            return mc;
+        }
+        if (mc != null) {
+            closeAndRemove(deviceId, mc, "连接已失效，重建前清理旧连接");
+        }
+        DeviceInfo device = requireDevice(deviceId);
+        updateStatus(deviceId, ConnectStatus.CONNECTING);
+        long begin = System.currentTimeMillis();
+        try {
+            mc = openConnection(device);
+        } catch (Exception e) {
+            updateStatus(deviceId, ConnectStatus.CONNECT_FAILED);
+            throw new IllegalStateException(
+                    "设备[" + device.getDeviceCode() + "]建立连接失败: " + e.getMessage());
+        }
+        updateStatus(deviceId, ConnectStatus.CONNECTED);
+        log.info("设备[{}]按需建立连接成功，耗时 {}ms",
+                device.getDeviceCode(), System.currentTimeMillis() - begin);
+        return mc;
+    }
+
+    private ManagedConnection openConnection(DeviceInfo device) throws Exception {
+        log.info("设备[{}]开始建立连接 {}:{}", device.getDeviceCode(), device.getIpAddress(), device.getPort());
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress(device.getIpAddress(),
+                device.getPort() == null ? 102 : device.getPort()), CONNECT_TIMEOUT_MS);
+        try {
+            S7Connector connector = S7ConnectorFactory.buildTCPConnector()
+                    .withHost(device.getIpAddress())
+                    .withPort(102)
+                    .withRack(RACK)
+                    .withSlot(SLOT)
+                    .withTimeout(CONNECT_TIMEOUT_MS)
+                    .build();
+            ManagedConnection mc = new ManagedConnection(
+                    device.getDeviceCode(), socket, connector, System.currentTimeMillis());
+            ManagedConnection old = connections.put(device.getId(), mc);
+            if (old != null) {
+                closeQuietly(old);
+            }
+            return mc;
+        } catch (Exception e) {
+            closeQuietly(socket);
+            throw e;
+        }
+    }
+
+    /** 扫描空闲连接，超过配置时长未使用则自动断开 */
+    private void reapIdleConnections() {
+        long timeoutMs = idleTimeoutMs();
+        long now = System.currentTimeMillis();
+        connections.forEach((deviceId, mc) -> {
+            long idleMs = now - mc.lastUsedAt;
+            if (idleMs >= timeoutMs) {
+                long idleSec = idleMs / 1000;
+                closeAndRemove(deviceId, mc, "空闲超过 " + idleSec + " 秒，自动断开");
+                updateStatus(deviceId, ConnectStatus.DISCONNECTED);
+            }
+        });
+    }
+
+    private long idleTimeoutMs() {
+        try {
+            String v = sysConfigService.getAll().get("connIdleTimeout");
+            if (v != null && !v.isBlank()) {
+                long sec = Long.parseLong(v.trim());
+                if (sec >= 5) {
+                    return sec * 1000L;
+                }
+            }
+        } catch (Exception ignored) {
+            // 配置缺失或非法时使用默认值
+        }
+        return DEFAULT_IDLE_TIMEOUT_MS;
+    }
+
+    private void touch(Long deviceId) {
+        ManagedConnection mc = connections.get(deviceId);
+        if (mc != null) {
+            mc.lastUsedAt = System.currentTimeMillis();
+        }
+    }
+
+    private void closeAndRemove(Long deviceId, ManagedConnection mc, String reason) {
+        if (connections.remove(deviceId, mc)) {
+            closeQuietly(mc);
+            log.info("设备[{}]断开连接，原因：{}", mc.deviceCode, reason);
+        }
+    }
+
+    private boolean isAlive(ManagedConnection mc) {
+        return mc.connector != null
+                && mc.socket != null
+                && mc.socket.isConnected()
+                && !mc.socket.isClosed();
+    }
+
+    private boolean updateStatus(Long id, ConnectStatus status) {
+        DeviceInfo entity = new DeviceInfo();
+        entity.setId(id);
+        entity.setStatus(status);
+        return deviceInfoService.updateById(entity);
     }
 
     private DeviceInfo requireDevice(Long id) {
@@ -82,199 +238,56 @@ public class DeviceConnectionManager {
         return device;
     }
 
-    private boolean updateStatus(Long id, ConnectStatus status) {
-        DeviceInfo entity = new DeviceInfo();
-        entity.setId(id);
-        entity.setStatus(status);
-        return deviceInfoService.updateById(entity);
+    private void closeQuietly(Socket socket) {
+        if (socket != null && !socket.isClosed()) {
+            try {
+                socket.close();
+            } catch (IOException e) {
+                log.debug("关闭连接异常: {}", e.getMessage());
+            }
+        }
     }
 
-    private void stopHandle(ConnectionHandle handle) {
-        handle.worker.stop();
-        handle.future.cancel(true);
+    private void closeQuietly(ManagedConnection mc) {
+        if (mc.connector != null) {
+            try {
+                mc.connector.close();
+            } catch (Exception e) {
+                log.debug("设备[{}]关闭 S7 连接异常: {}", mc.deviceCode, e.getMessage());
+            }
+        }
+        if (mc.socket != null && !mc.socket.isClosed()) {
+            try {
+                mc.socket.close();
+            } catch (IOException e) {
+                log.debug("设备[{}]关闭连接异常: {}", mc.deviceCode, e.getMessage());
+            }
+        }
     }
 
     @PreDestroy
     public void shutdown() {
-        connections.values().forEach(this::stopHandle);
-        connections.clear();
+        connections.forEach((id, mc) -> {
+            closeAndRemove(id, mc, "服务关闭");
+            updateStatus(id, ConnectStatus.DISCONNECTED);
+        });
         executor.shutdownNow();
+        reaper.shutdownNow();
     }
 
-    private static class ConnectionHandle {
+    private static class ManagedConnection {
 
-        private final ConnectionWorker worker;
-        private final Future<?> future;
-
-        ConnectionHandle(ConnectionWorker worker, Future<?> future) {
-            this.worker = worker;
-            this.future = future;
-        }
-    }
-
-    private class ConnectionWorker implements Runnable {
-
-        private final Long id;
         private final String deviceCode;
-        private final String ip;
-        private final Integer port;
-
-        private volatile boolean running = true;
-        private volatile Socket socket;
-        private volatile S7Connector s7Connector;
+        private final Socket socket;
+        private final S7Connector connector;
         private final Object ioLock = new Object();
+        private volatile long lastUsedAt;
 
-        ConnectionWorker(Long id, String deviceCode, String ip, Integer port) {
-            this.id = id;
+        ManagedConnection(String deviceCode, Socket socket, S7Connector connector, long lastUsedAt) {
             this.deviceCode = deviceCode;
-            this.ip = ip;
-            this.port = port;
-        }
-
-        @Override
-        public void run() {
-            int attempt = 0;
-            while (running) {
-                attempt++;
-                try {
-                    connectOnce(attempt);
-                    monitorUntilLost();
-                    if (running) {
-                        log.warn("设备[{}]连接中断，{}秒后重连", deviceCode, RETRY_INTERVAL_MS / 1000);
-                        sleep(RETRY_INTERVAL_MS);
-                    }
-                } finally {
-                    closeQuietly(socket);
-                    socket = null;
-                    closeS7Quietly();
-                }
-            }
-            log.info("设备[{}]连接任务结束", deviceCode);
-        }
-
-        private void connectOnce(int attempt) {
-            try {
-                log.info("设备[{}]第{}次尝试连接 {}:{} (S7 rack={} slot={})", deviceCode, attempt, ip, port, RACK, SLOT);
-                socket = new Socket();
-                socket.connect(new InetSocketAddress(ip, port), CONNECT_TIMEOUT_MS);
-                openS7();
-                updateStatus(ConnectStatus.CONNECTED);
-                log.info("设备[{}]连接成功", deviceCode);
-            } catch (SocketTimeoutException e) {
-                cleanupAfterFailure();
-                updateStatus(ConnectStatus.CONNECT_TIMEOUT);
-                log.warn("设备[{}]连接超时({}ms)，{}秒后重试", deviceCode, CONNECT_TIMEOUT_MS, RETRY_INTERVAL_MS / 1000);
-                sleep(RETRY_INTERVAL_MS);
-            } catch (IOException | RuntimeException e) {
-                cleanupAfterFailure();
-                updateStatus(ConnectStatus.CONNECT_FAILED);
-                log.warn("设备[{}]连接失败: {}，{}秒后重试", deviceCode, e.getMessage(), RETRY_INTERVAL_MS / 1000);
-                sleep(RETRY_INTERVAL_MS);
-            }
-        }
-
-        private void openS7() {
-            try {
-                s7Connector = S7ConnectorFactory.buildTCPConnector()
-                        .withHost(ip)
-                        .withPort(S7_PORT)
-                        .withRack(RACK)
-                        .withSlot(SLOT)
-                        .withTimeout(CONNECT_TIMEOUT_MS)
-                        .build();
-                log.info("设备[{}]S7 握手成功", deviceCode);
-            } catch (Exception e) {
-                throw new IllegalStateException("S7 握手失败: " + e.getMessage(), e);
-            }
-        }
-
-        private void cleanupAfterFailure() {
-            closeQuietly(socket);
-            socket = null;
-            closeS7Quietly();
-        }
-
-        private void monitorUntilLost() {
-            while (running) {
-                sleep(MONITOR_INTERVAL_MS);
-                Socket s = socket;
-                if (s == null || s.isClosed() || !s.isConnected()) {
-                    break;
-                }
-            }
-        }
-
-        boolean isAlive() {
-            return running && s7Connector != null
-                    && socket != null && socket.isConnected() && !socket.isClosed();
-        }
-
-        byte[] readDB(int dbNumber, int start, int size) {
-            synchronized (ioLock) {
-                S7Connector connector = s7Connector;
-                if (connector == null) {
-                    throw new IllegalStateException("堆垛机未连接，请先连接设备");
-                }
-                try {
-                    return connector.read(DaveArea.DB, dbNumber, size, start);
-                } catch (Exception e) {
-                    log.error("设备[{}]读取 DB{} 偏移{} 长度{} 失败: {}", deviceCode, dbNumber, start, size, e.getMessage());
-                    throw new IllegalStateException("S7 读取失败: " + e.getMessage());
-                }
-            }
-        }
-
-        private boolean updateStatus(ConnectStatus status) {
-            if (!deviceInfoService.updateById(statusEntity(status))) {
-                log.error("设备[{}]状态更新失败(可能已删除)，停止连接任务", deviceCode);
-                stop();
-                return false;
-            }
-            return true;
-        }
-
-        private DeviceInfo statusEntity(ConnectStatus status) {
-            DeviceInfo entity = new DeviceInfo();
-            entity.setId(id);
-            entity.setStatus(status);
-            return entity;
-        }
-
-        private void sleep(long millis) {
-            try {
-                Thread.sleep(millis);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                running = false;
-            }
-        }
-
-        private void closeQuietly(Socket s) {
-            if (s != null && !s.isClosed()) {
-                try {
-                    s.close();
-                } catch (IOException e) {
-                    log.debug("设备[{}]关闭连接异常: {}", deviceCode, e.getMessage());
-                }
-            }
-        }
-
-        private void closeS7Quietly() {
-            S7Connector c = s7Connector;
-            s7Connector = null;
-            if (c != null) {
-                try {
-                    c.close();
-                } catch (Exception e) {
-                    log.debug("设备[{}]关闭 S7 连接异常: {}", deviceCode, e.getMessage());
-                }
-            }
-        }
-
-        void stop() {
-            running = false;
-            closeQuietly(socket);
-            closeS7Quietly();
+            this.socket = socket;
+            this.connector = connector;
+            this.lastUsedAt = lastUsedAt;
         }
     }
 }

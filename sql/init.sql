@@ -182,9 +182,7 @@ INSERT INTO sys_config (config_key, config_value) VALUES
 ('warehouseCode',    N'WH001'),
 ('pageSize',         N'20'),
 ('connectTimeout',   N'5000'),
-('heartbeatInterval',N'10'),
-('autoReconnect',    N'true'),
-('reconnectTimes',   N'3'),
+('connIdleTimeout',  N'60'),
 ('autoDispatch',     N'true'),
 ('dispatchInterval', N'5'),
 ('maxTaskPerDevice', N'2'),
@@ -192,6 +190,43 @@ INSERT INTO sys_config (config_key, config_value) VALUES
 ('alarmSound',       N'false'),
 ('opLogKeepDays',    N'90'),
 ('alarmLogKeepDays', N'30');
+GO
+
+/* ---------- 堆垛机状态监控任务表 ---------- */
+CREATE TABLE monitor_task (
+    id               INT IDENTITY(1,1) PRIMARY KEY,
+    task_no          VARCHAR(40)   NOT NULL UNIQUE,
+    task_type        NVARCHAR(30)  NOT NULL DEFAULT N'STACKER_MONITOR',
+    task_name        NVARCHAR(100) NOT NULL,
+    device_id        INT           NOT NULL,
+    exec_count       INT           NULL,
+    interval_seconds INT           NOT NULL DEFAULT 5,
+    status           NVARCHAR(20)  NOT NULL DEFAULT 'STOPPED',
+    executed_count   INT           NOT NULL DEFAULT 0,
+    last_run_time    DATETIME2(0)  NULL,
+    remark           NVARCHAR(200) NULL,
+    create_time      DATETIME2(0)  NOT NULL DEFAULT SYSDATETIME()
+);
+GO
+CREATE INDEX idx_mtask_device ON monitor_task (device_id);
+CREATE INDEX idx_mtask_status ON monitor_task (status);
+GO
+
+/* ---------- 监控任务采集数据表 ---------- */
+CREATE TABLE monitor_task_data (
+    id           INT IDENTITY(1,1) PRIMARY KEY,
+    task_id      INT           NOT NULL,
+    device_id    INT           NOT NULL,
+    config_id    INT           NULL,
+    config_name  NVARCHAR(50)  NULL,
+    db_number    INT           NULL,
+    start_offset INT           NULL,
+    data_type    VARCHAR(20)   NULL,
+    raw_value    NVARCHAR(200) NULL,
+    collect_time DATETIME2(0)  NOT NULL DEFAULT SYSDATETIME()
+);
+GO
+CREATE INDEX idx_mtdata_task_time ON monitor_task_data (task_id, collect_time DESC);
 GO
 
 INSERT INTO sys_user (username, password, real_name, role)
