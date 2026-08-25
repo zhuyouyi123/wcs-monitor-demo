@@ -4,6 +4,19 @@ server:
 spring:
   application:
     name: wcs-monitor-demo
+  datasource:
+    driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
+    url: jdbc:sqlserver://localhost:1433;databaseName=wcs_manager;encrypt=false;trustServerCertificate=true
+    username: sa
+    password: 1234567
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
 
 logging:
   level:
