@@ -82,15 +82,26 @@ public class MonitorTaskController {
         }
     }
 
-    /** 任务采集数据分页，按采集时间倒序 */
+    /** 全部设备最新一轮采集数据（表内仅保留每台设备最近一次采集结果） */
+    @GetMapping("/data/latest")
+    public Result<List<MonitorTaskData>> latestData() {
+        return Result.ok(monitorTaskDataMapper.selectList(
+                new LambdaQueryWrapper<MonitorTaskData>()
+                        .orderByAsc(MonitorTaskData::getDeviceId)
+                        .orderByAsc(MonitorTaskData::getStartOffset)));
+    }
+
+    /** 任务采集数据分页，按采集时间倒序，可按 DB 块号过滤 */
     @GetMapping("/{id}/data")
     public Result<IPage<MonitorTaskData>> data(@PathVariable Long id,
                                                @RequestParam(defaultValue = "1") long current,
-                                               @RequestParam(defaultValue = "20") long size) {
+                                               @RequestParam(defaultValue = "20") long size,
+                                               @RequestParam(required = false) Integer dbNumber) {
         Page<MonitorTaskData> page = new Page<>(current, size);
         return Result.ok(monitorTaskDataMapper.selectPage(page,
                 new LambdaQueryWrapper<MonitorTaskData>()
                         .eq(MonitorTaskData::getTaskId, id)
+                        .eq(dbNumber != null, MonitorTaskData::getDbNumber, dbNumber)
                         .orderByDesc(MonitorTaskData::getCollectTime)
                         .orderByDesc(MonitorTaskData::getId)));
     }

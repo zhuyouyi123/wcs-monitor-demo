@@ -28,6 +28,9 @@ public class CommTestConfig {
 
     private S7DataType dataType;
 
+    /** 关联的数据字典键（可选）：读取值按 字典值->含义 自动转换 */
+    private String dictKey;
+
     private String remark;
 
     private LocalDateTime createTime;

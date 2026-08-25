@@ -113,6 +113,15 @@ public class DeviceConnectionManager {
             try {
                 return mc.connector.read(DaveArea.DB, dbNumber, size, start);
             } catch (Exception e) {
+                // 读取被线程中断（如监控任务停止）属正常停止路径：关闭连接但不标记设备故障
+                if (isInterruption(e)) {
+                    Thread.currentThread().interrupt();
+                    String reason = "通信线程被中断（任务停止）";
+                    log.info("设备[{}]断开连接，原因：{}", mc.deviceCode, reason);
+                    closeAndRemove(deviceId, mc, reason);
+                    updateStatus(deviceId, ConnectStatus.DISCONNECTED);
+                    throw new IllegalStateException("S7 读取被中断");
+                }
                 String reason = "通信异常: " + e.getMessage();
                 log.warn("设备[{}]断开连接，原因：{}（读取 DB{} 偏移{} 失败）",
                         mc.deviceCode, reason, dbNumber, start);
@@ -121,6 +130,18 @@ public class DeviceConnectionManager {
                 throw new IllegalStateException("S7 读取失败: " + e.getMessage());
             }
         }
+    }
+
+    /** 判断异常链中是否包含线程中断 */
+    private static boolean isInterruption(Throwable e) {
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof InterruptedException || t instanceof java.io.InterruptedIOException) {
+                return true;
+            }
+            t = t.getCause() == t ? null : t.getCause();
+        }
+        return Thread.currentThread().isInterrupted();
     }
 
     private ManagedConnection ensureConnected(Long deviceId) {

@@ -26,6 +26,12 @@ public class DeviceInfo {
 
     private Integer port;
 
+    /** 货架层数（可视化二维展示用） */
+    private Integer rackLevels;
+
+    /** 货架列数（可视化二维展示用） */
+    private Integer rackCols;
+
     private ConnectStatus status;
 
     private LocalDateTime lastHeartbeat;

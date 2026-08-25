@@ -10,6 +10,7 @@ import com.wcs.monitor.mapper.MonitorTaskMapper;
 import com.wcs.monitor.service.DeviceCommBindingService;
 import com.wcs.monitor.service.DeviceConnectionManager;
 import com.wcs.monitor.service.DeviceInfoService;
+import com.wcs.monitor.service.SysDictItemService;
 import com.wcs.monitor.util.S7DataUtil;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -40,6 +41,7 @@ public class MonitorTaskEngine {
     private final DeviceInfoService deviceInfoService;
     private final DeviceCommBindingService deviceCommBindingService;
     private final DeviceConnectionManager connectionManager;
+    private final SysDictItemService sysDictItemService;
 
     private final Map<Long, Future<?>> futures = new ConcurrentHashMap<>();
 
@@ -117,6 +119,12 @@ public class MonitorTaskEngine {
                     markStopped(taskId);
                     return;
                 } catch (Exception e) {
+                    // 停止任务会打断进行中的读取，属正常停止路径，不按失败记录
+                    if (Thread.currentThread().isInterrupted() || hasCause(e, InterruptedException.class)) {
+                        Thread.currentThread().interrupt();
+                        cancelled = true;
+                        break;
+                    }
                     log.warn("监控任务[{}]本轮执行失败，原因：{}", current.getTaskName(), e.getMessage());
                 }
                 long intervalMs = Math.max(1, current.getIntervalSeconds() == null ? 5 : current.getIntervalSeconds()) * 1000L;
@@ -149,7 +157,9 @@ public class MonitorTaskEngine {
         for (CommTestConfig config : configs) {
             byte[] raw = connectionManager.readDB(task.getDeviceId(),
                     config.getDbNumber(), config.getStartOffset(), config.getReadLength());
-            String value = String.join(",", S7DataUtil.decode(raw, config.getDataType()));
+            List<String> decoded = S7DataUtil.decode(raw, config.getDataType());
+            String value = String.join(",", decoded);
+            Map<String, SysDictItemService.DictValueInfo> dict = sysDictItemService.valueInfoMap(config.getDictKey());
             MonitorTaskData record = new MonitorTaskData();
             record.setTaskId(task.getId());
             record.setDeviceId(task.getDeviceId());
@@ -159,6 +169,20 @@ public class MonitorTaskEngine {
             record.setStartOffset(config.getStartOffset());
             record.setDataType(config.getDataType().getCode());
             record.setRawValue(value);
+            // 配置关联了字典时，把采集值转换为对应含义并带上颜色；无字典则不转换
+            if (!dict.isEmpty()) {
+                java.util.StringJoiner converted = new java.util.StringJoiner(",");
+                String color = null;
+                for (String v : decoded) {
+                    SysDictItemService.DictValueInfo info = dict.get(v);
+                    converted.add(info != null ? info.getLabel() : v);
+                    if (color == null && info != null && info.getColor() != null) {
+                        color = info.getColor();
+                    }
+                }
+                record.setDictLabel(converted.toString());
+                record.setDictColor(color);
+            }
             record.setCollectTime(now);
             dataMapper.insert(record);
         }
@@ -194,6 +218,18 @@ public class MonitorTaskEngine {
     public void shutdown() {
         futures.keySet().forEach(this::stop);
         pool.shutdownNow();
+    }
+
+    /** 判断异常链中是否包含指定类型的异常 */
+    private static boolean hasCause(Throwable e, Class<? extends Throwable> type) {
+        Throwable t = e;
+        while (t != null) {
+            if (type.isInstance(t)) {
+                return true;
+            }
+            t = t.getCause() == t ? null : t.getCause();
+        }
+        return false;
     }
 
     /** 导致任务无法继续的致命错误（如设备被删除） */

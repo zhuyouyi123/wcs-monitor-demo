@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.wcs.monitor.entity.CommTestConfig;
 import com.wcs.monitor.mapper.CommTestConfigMapper;
 import com.wcs.monitor.service.CommTestConfigService;
+import com.wcs.monitor.service.SysDictItemService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -12,6 +13,8 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 public class CommTestConfigServiceImpl extends ServiceImpl<CommTestConfigMapper, CommTestConfig>
         implements CommTestConfigService {
+
+    private final SysDictItemService sysDictItemService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -53,6 +56,14 @@ public class CommTestConfigServiceImpl extends ServiceImpl<CommTestConfigMapper,
         }
         if (config.getReadLength() == null || config.getReadLength() < 1 || config.getReadLength() > 512) {
             throw new IllegalArgumentException("读取长度必须在 1-512 字节之间");
+        }
+        if (config.getDictKey() != null && !config.getDictKey().isBlank()) {
+            config.setDictKey(config.getDictKey().trim());
+            if (sysDictItemService.labelMap(config.getDictKey()).isEmpty()) {
+                throw new IllegalArgumentException("关联的字典[" + config.getDictKey() + "]不存在或尚未配置字典项");
+            }
+        } else {
+            config.setDictKey(null);
         }
     }
 

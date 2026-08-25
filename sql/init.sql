@@ -32,6 +32,8 @@ CREATE TABLE device_info (
     device_type     NVARCHAR(20)  NULL,
     ip_address      VARCHAR(50)   NULL,
     port            INT           NULL,
+    rack_levels     INT           NULL,
+    rack_cols       INT           NULL,
     status          NVARCHAR(20)  NOT NULL DEFAULT 'DISCONNECTED',
     last_heartbeat  DATETIME2(0)  NULL,
     remark          NVARCHAR(200) NULL,
@@ -129,6 +131,7 @@ CREATE TABLE comm_test_config (
     start_offset INT           NOT NULL DEFAULT 0,
     read_length  INT           NOT NULL DEFAULT 4,
     data_type    VARCHAR(20)   NOT NULL DEFAULT 'BYTE',
+    dict_key     VARCHAR(50)   NULL,
     remark       NVARCHAR(200) NULL,
     create_time  DATETIME2(0)  NOT NULL DEFAULT SYSDATETIME()
 );
@@ -223,10 +226,34 @@ CREATE TABLE monitor_task_data (
     start_offset INT           NULL,
     data_type    VARCHAR(20)   NULL,
     raw_value    NVARCHAR(200) NULL,
+    dict_label   NVARCHAR(100) NULL,
+    dict_color   VARCHAR(20)   NULL,
     collect_time DATETIME2(0)  NOT NULL DEFAULT SYSDATETIME()
 );
 GO
 CREATE INDEX idx_mtdata_task_time ON monitor_task_data (task_id, collect_time DESC);
+GO
+
+/* ---------- 数据字典表 ---------- */
+CREATE TABLE sys_dict_item (
+    id          INT IDENTITY(1,1) PRIMARY KEY,
+    dict_name   NVARCHAR(100) NOT NULL,
+    dict_key    VARCHAR(50)   NOT NULL,
+    dict_value  VARCHAR(50)   NOT NULL,
+    dict_label  NVARCHAR(100) NOT NULL,
+    dict_color  VARCHAR(20)   NULL,
+    sort_order  INT           NOT NULL DEFAULT 0,
+    create_time DATETIME2(0)  NOT NULL DEFAULT SYSDATETIME()
+);
+GO
+CREATE UNIQUE INDEX uq_dict_item ON sys_dict_item (dict_key, dict_value);
+GO
+
+INSERT INTO sys_dict_item ([dict_name], [dict_key], [dict_value], [dict_label], [dict_color], [sort_order]) VALUES
+(N'堆垛机采集状态', N'STACKER_COLLECT_STATUS', N'0', N'其它', '#909399', 0),
+(N'堆垛机采集状态', N'STACKER_COLLECT_STATUS', N'1', N'空闲', '#409EFF', 1),
+(N'堆垛机采集状态', N'STACKER_COLLECT_STATUS', N'2', N'运行', '#67C23A', 2),
+(N'堆垛机采集状态', N'STACKER_COLLECT_STATUS', N'3', N'故障', '#F56C6C', 3);
 GO
 
 INSERT INTO sys_user (username, password, real_name, role)

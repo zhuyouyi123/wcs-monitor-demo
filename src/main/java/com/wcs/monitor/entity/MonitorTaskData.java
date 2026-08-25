@@ -33,5 +33,11 @@ public class MonitorTaskData {
 
     private String rawValue;
 
+    /** 按配置关联字典转换后的含义（无字典或未命中时为空） */
+    private String dictLabel;
+
+    /** 字典项颜色（采集值命中字典时带入） */
+    private String dictColor;
+
     private LocalDateTime collectTime;
 }
